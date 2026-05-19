@@ -1,13 +1,8 @@
 """Lightweight system performance monitoring and safe response for Hermes.
 
-This monitor is intentionally cheap: it samples local CPU, memory, swap, disk,
-battery, load, process count, and hottest processes in a daemon thread. It then
-emits grep-friendly ``[PERF] ...`` log lines, writes a persistent baseline file,
-and performs only conservative self-protection actions by default.
-
-Why not have the local model reason every few seconds? Because that can become
-the performance problem. This monitor does frequent telemetry cheaply and leaves
-heavier agent reasoning for pressure events or explicit user workflows.
+Samples CPU, memory, swap, disk, battery, load, process count, and hot
+processes. It writes a baseline, writes process-pressure audits when pressure is
+high, and takes only conservative Hermes-self actions by default.
 
 Config: ``logging.performance_monitor`` in ``config.yaml``.
 """
@@ -20,7 +15,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -38,6 +33,7 @@ _lock = threading.Lock()
 
 _BYTES_TO_MB = 1024 * 1024
 _BASELINE_FILENAME = "performance-baseline.json"
+_AUDIT_FILENAME = "performance-process-audit.json"
 _ACTION_COOLDOWN_SECONDS = 300.0
 
 
@@ -56,6 +52,7 @@ class PerformanceSnapshot:
     power_plugged: Optional[bool]
     top_cpu: str
     top_memory: str
+    process_audit_summary: str
     pressure: str
     score: int
     checks: tuple[str, ...]
@@ -63,6 +60,32 @@ class PerformanceSnapshot:
     action: str
     uptime_seconds: int
     sampled_at: str
+
+
+@dataclass(frozen=True)
+class ProcessAuditItem:
+    pid: int
+    name: str
+    username: str
+    cpu_percent: float
+    memory_percent: float
+    status: str
+    category: str
+    risk: str
+    recommended_action: str
+    safe_auto_action: bool
+    cmdline: str = ""
+
+
+@dataclass(frozen=True)
+class ProcessAudit:
+    sampled_at: str
+    process_count: int
+    category_counts: dict[str, int] = field(default_factory=dict)
+    heavy_cpu: list[ProcessAuditItem] = field(default_factory=list)
+    heavy_memory: list[ProcessAuditItem] = field(default_factory=list)
+    candidates: list[ProcessAuditItem] = field(default_factory=list)
+    summary: str = "no audit collected"
 
 
 def _import_psutil():
@@ -87,27 +110,30 @@ def _baseline_path() -> Path:
     return _hermes_home() / _BASELINE_FILENAME
 
 
+def _audit_path() -> Path:
+    return _hermes_home() / _AUDIT_FILENAME
+
+
+def _safe_str(value: object, limit: int = 220) -> str:
+    return str(value or "").replace("\n", " ").strip()[:limit]
+
+
 def _fmt_process(proc: object, metric: str) -> str:
-    """Format a psutil process for compact log output."""
     try:
         info = getattr(proc, "info", {}) or {}
-        name = str(info.get("name") or "unknown").replace(" ", "_")[:28]
+        name = _safe_str(info.get("name") or "unknown", 28).replace(" ", "_")
         pid = info.get("pid")
-        value = info.get(metric)
-        if value is None:
-            value = 0.0
-        if metric == "memory_percent":
-            return f"{name}:{pid}:{float(value):.1f}%mem"
-        return f"{name}:{pid}:{float(value):.1f}%cpu"
+        value = float(info.get(metric) or 0.0)
+        suffix = "%mem" if metric == "memory_percent" else "%cpu"
+        return f"{name}:{pid}:{value:.1f}{suffix}"
     except Exception:
         return "unknown"
 
 
 def _top_processes(psutil, metric: str, limit: int = 5) -> str:
-    attrs = ["pid", "name", metric]
     try:
         procs = []
-        for proc in psutil.process_iter(attrs=attrs):
+        for proc in psutil.process_iter(attrs=["pid", "name", metric]):
             try:
                 value = float((proc.info or {}).get(metric) or 0.0)
                 if value > 0:
@@ -120,8 +146,94 @@ def _top_processes(psutil, metric: str, limit: int = 5) -> str:
         return "unavailable"
 
 
+def _categorize_process(info: dict) -> str:
+    name = str(info.get("name") or "").lower()
+    cmdline = " ".join(info.get("cmdline") or []).lower()
+    blob = f"{name} {cmdline}"
+    if "hermes" in blob or "cartha-voice-listener" in blob:
+        return "hermes"
+    if any(x in blob for x in ("google chrome helper", "webkit.webcontent", "codex helper", "electron", "renderer")):
+        return "browser-helper"
+    if any(x in blob for x in ("google drive", "drivefs", "dropbox", "onedrive", "icloud")):
+        return "sync-service"
+    if any(x in blob for x in ("xcodebuild", "node", "npm", "pnpm", "yarn", "python", "dart", "flutter", "gradle", "java")):
+        return "developer-job"
+    if any(x in blob for x in ("launchd", "agent", "daemon", "helper")):
+        return "background-service"
+    return "user-process"
+
+
+def _process_recommendation(category: str, cpu: float, mem: float, status: str) -> tuple[str, str, bool]:
+    if status.lower() == "zombie":
+        return "high", "inspect parent process; zombie cannot be killed directly", False
+    if category == "hermes" and (cpu >= 50 or mem >= 1.0):
+        return "high", "Hermes is costly; lower priority, collect garbage, or restart Hermes gateway if leak persists", True
+    if category == "browser-helper" and (cpu >= 35 or mem >= 1.0):
+        return "medium", "browser helper is heavy; consider closing unused tabs/windows", False
+    if category == "sync-service" and (cpu >= 25 or mem >= 1.0):
+        return "medium", "sync service is heavy; consider pausing sync during builds or local model work", False
+    if category == "developer-job" and cpu >= 60:
+        return "medium", "developer job is CPU-heavy; let it finish or cancel the specific build/test if stale", False
+    if cpu >= 90 or mem >= 4.0:
+        return "high", "very heavy process; inspect before stopping", False
+    if cpu >= 35 or mem >= 1.0:
+        return "medium", "notable resource usage; monitor trend", False
+    return "low", "observe", False
+
+
+def _audit_processes(psutil, limit: int = 10) -> ProcessAudit:
+    items: list[ProcessAuditItem] = []
+    category_counts: dict[str, int] = {}
+    attrs = ["pid", "name", "username", "cpu_percent", "memory_percent", "status", "cmdline"]
+    try:
+        iterator = psutil.process_iter(attrs=attrs)
+    except Exception:
+        iterator = []
+    for proc in iterator:
+        try:
+            info = proc.info or {}
+            category = _categorize_process(info)
+            category_counts[category] = category_counts.get(category, 0) + 1
+            cpu = float(info.get("cpu_percent") or 0.0)
+            mem = float(info.get("memory_percent") or 0.0)
+            status = str(info.get("status") or "unknown")
+            risk, recommendation, safe = _process_recommendation(category, cpu, mem, status)
+            items.append(ProcessAuditItem(
+                pid=int(info.get("pid") or 0),
+                name=_safe_str(info.get("name") or "unknown", 80),
+                username=_safe_str(info.get("username") or "unknown", 80),
+                cpu_percent=round(cpu, 2),
+                memory_percent=round(mem, 2),
+                status=status,
+                category=category,
+                risk=risk,
+                recommended_action=recommendation,
+                safe_auto_action=safe,
+                cmdline=_safe_str(" ".join(info.get("cmdline") or [])),
+            ))
+        except Exception:
+            continue
+    heavy_cpu = sorted(items, key=lambda i: i.cpu_percent, reverse=True)[:limit]
+    heavy_memory = sorted(items, key=lambda i: i.memory_percent, reverse=True)[:limit]
+    candidates = sorted(
+        [i for i in items if i.risk in {"medium", "high"}],
+        key=lambda i: (i.risk == "high", i.cpu_percent + i.memory_percent),
+        reverse=True,
+    )[:limit]
+    top_categories = sorted(category_counts.items(), key=lambda kv: kv[1], reverse=True)[:4]
+    summary = ";".join(f"{name}={count}" for name, count in top_categories) or "no-processes"
+    return ProcessAudit(
+        sampled_at=datetime.now(timezone.utc).isoformat(),
+        process_count=len(items),
+        category_counts=category_counts,
+        heavy_cpu=heavy_cpu,
+        heavy_memory=heavy_memory,
+        candidates=candidates,
+        summary=summary,
+    )
+
+
 def _score_from_pressure(cpu: float, mem: float, swap: float, disk: float, available_mb: int, load_per_core: Optional[float], process_count: int = 0) -> int:
-    """Return a 0-100 health score, where 100 is healthier."""
     score = 100
     score -= max(0, int((cpu - 55) * 0.6))
     score -= max(0, int((mem - 65) * 0.9))
@@ -136,15 +248,7 @@ def _score_from_pressure(cpu: float, mem: float, swap: float, disk: float, avail
     return max(0, min(100, score))
 
 
-def _classify_pressure(
-    cpu: float,
-    mem: float,
-    swap: float,
-    disk: float,
-    available_mb: int,
-    load_per_core: Optional[float] = None,
-    process_count: int = 0,
-) -> tuple[str, int, tuple[str, ...], str]:
+def _classify_pressure(cpu: float, mem: float, swap: float, disk: float, available_mb: int, load_per_core: Optional[float] = None, process_count: int = 0) -> tuple[str, int, tuple[str, ...], str]:
     checks: list[str] = []
     if available_mb < 750 or mem >= 92 or swap >= 70:
         checks.append("memory-critical")
@@ -152,21 +256,18 @@ def _classify_pressure(
         checks.append("memory-high")
     else:
         checks.append("memory-ok")
-
     if cpu >= 92 or (load_per_core is not None and load_per_core >= 2.0):
         checks.append("cpu-critical")
     elif cpu >= 80 or (load_per_core is not None and load_per_core >= 1.35):
         checks.append("cpu-high")
     else:
         checks.append("cpu-ok")
-
     if disk >= 95:
         checks.append("disk-critical")
     elif disk >= 88:
         checks.append("disk-high")
     else:
         checks.append("disk-ok")
-
     if process_count >= 1200:
         checks.append("process-critical")
     elif process_count >= 900:
@@ -175,13 +276,7 @@ def _classify_pressure(
         checks.append("process-ok")
 
     score = _score_from_pressure(cpu, mem, swap, disk, available_mb, load_per_core, process_count)
-    if any(c.endswith("critical") for c in checks):
-        pressure = "critical"
-    elif any(c.endswith("high") for c in checks):
-        pressure = "high"
-    else:
-        pressure = "normal"
-
+    pressure = "critical" if any(c.endswith("critical") for c in checks) else "high" if any(c.endswith("high") for c in checks) else "normal"
     if "memory-critical" in checks:
         recommendation = "free-memory-swap: collect Hermes garbage, pause new local-model runs, close memory-heavy apps"
     elif "cpu-critical" in checks:
@@ -202,27 +297,22 @@ def _classify_pressure(
 
 
 def _safe_action_for_snapshot(snapshot: PerformanceSnapshot) -> str:
-    """Take conservative action that cannot close user apps or delete files."""
     global _last_gc_action_at, _self_niced
-
     if not _auto_actions_enabled:
         return "disabled"
     actions: list[str] = []
     now = time.monotonic()
-
     if snapshot.pressure in {"high", "critical"} and now - _last_gc_action_at >= _ACTION_COOLDOWN_SECONDS:
         collected = gc.collect()
         _last_gc_action_at = now
         actions.append(f"gc.collect:{collected}")
-
     if "cpu-critical" in snapshot.checks and not _self_niced:
         try:
-            os.nice(5)  # Lower Hermes priority so user-facing apps stay responsive.
+            os.nice(5)
             _self_niced = True
             actions.append("lowered-hermes-priority")
         except Exception as exc:
             actions.append(f"lower-priority-failed:{type(exc).__name__}")
-
     if not actions:
         return "observe"
     action = "+".join(actions)
@@ -231,15 +321,9 @@ def _safe_action_for_snapshot(snapshot: PerformanceSnapshot) -> str:
 
 
 def collect_performance_snapshot(apply_actions: bool = False) -> Optional[PerformanceSnapshot]:
-    """Collect a cheap point-in-time system performance snapshot.
-
-    Returns ``None`` when psutil is unavailable rather than raising; callers can
-    disable the monitor gracefully.
-    """
     psutil = _import_psutil()
     if psutil is None:
         return None
-
     try:
         cpu_count = int(psutil.cpu_count() or 1)
         cpu_percent = float(psutil.cpu_percent(interval=0.1))
@@ -263,7 +347,6 @@ def collect_performance_snapshot(apply_actions: bool = False) -> Optional[Perfor
             process_count = len(psutil.pids())
         except Exception:
             process_count = 0
-
         available_mb = int(getattr(vm, "available", 0) / _BYTES_TO_MB)
         pressure, score, checks, recommendation = _classify_pressure(
             cpu=cpu_percent,
@@ -274,7 +357,6 @@ def collect_performance_snapshot(apply_actions: bool = False) -> Optional[Perfor
             load_per_core=load_per_core,
             process_count=process_count,
         )
-        uptime = int(time.monotonic() - _start_time) if _start_time else 0
         snapshot = PerformanceSnapshot(
             cpu_percent=cpu_percent,
             memory_percent=float(vm.percent),
@@ -289,17 +371,17 @@ def collect_performance_snapshot(apply_actions: bool = False) -> Optional[Perfor
             power_plugged=power_plugged,
             top_cpu=_top_processes(psutil, "cpu_percent"),
             top_memory=_top_processes(psutil, "memory_percent"),
+            process_audit_summary="not-collected",
             pressure=pressure,
             score=score,
             checks=checks,
             recommendation=recommendation,
             action="pending" if apply_actions else "observe",
-            uptime_seconds=uptime,
+            uptime_seconds=int(time.monotonic() - _start_time) if _start_time else 0,
             sampled_at=datetime.now(timezone.utc).isoformat(),
         )
         if apply_actions:
-            action = _safe_action_for_snapshot(snapshot)
-            snapshot = PerformanceSnapshot(**{**asdict(snapshot), "action": action})
+            snapshot = PerformanceSnapshot(**{**asdict(snapshot), "action": _safe_action_for_snapshot(snapshot)})
         return snapshot
     except Exception as exc:
         logger.debug("Performance snapshot failed: %s", exc)
@@ -318,30 +400,70 @@ def _write_baseline(snapshot: PerformanceSnapshot) -> None:
                 "observe and log full telemetry",
                 "collect Hermes Python garbage during high/critical pressure",
                 "lower Hermes process priority during critical CPU pressure",
+                "write process-pressure audit evidence for high/critical pressure",
             ],
             "not_done_by_default": [
                 "kill user applications",
                 "delete files or caches",
+                "pause sync services",
                 "run expensive local-model reasoning on every sample",
             ],
         },
     }
-    path = _baseline_path()
     try:
+        path = _baseline_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         logger.info("[PERF_BASELINE] wrote=%s score=%d pressure=%s", path, snapshot.score, snapshot.pressure)
     except Exception as exc:
-        logger.debug("Failed to write performance baseline %s: %s", path, exc)
+        logger.debug("Failed to write performance baseline: %s", exc)
+
+
+def _write_process_audit(audit: ProcessAudit, snapshot: PerformanceSnapshot) -> None:
+    payload = {
+        "schema_version": 1,
+        "purpose": "Hermes process-pressure audit for safe performance tuning.",
+        "snapshot": asdict(snapshot),
+        "audit": asdict(audit),
+        "policy": {
+            "safe_auto_actions": [
+                "lower Hermes priority under critical CPU pressure",
+                "collect Hermes Python garbage under high/critical pressure",
+                "write audit evidence for later model/user review",
+            ],
+            "requires_user_or_policy_approval": [
+                "kill or quit non-Hermes applications",
+                "pause Google Drive, Dropbox, OneDrive, iCloud, or browser sync",
+                "delete caches or files",
+                "terminate build/test/developer jobs",
+            ],
+        },
+    }
+    try:
+        path = _audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        logger.warning(
+            "[PERF_AUDIT] wrote=%s pressure=%s score=%d process_count=%d candidates=%d summary=%s",
+            path, snapshot.pressure, snapshot.score, audit.process_count, len(audit.candidates), audit.summary,
+        )
+    except Exception as exc:
+        logger.debug("Failed to write process audit: %s", exc)
 
 
 def log_performance_snapshot(prefix: str = "", apply_actions: bool = True) -> Optional[PerformanceSnapshot]:
-    """Log a single structured ``[PERF]`` line and return the snapshot."""
     snapshot = collect_performance_snapshot(apply_actions=apply_actions)
     tag = f"{prefix} " if prefix else ""
     if snapshot is None:
         logger.info("[PERF] %sunavailable", tag)
         return None
+
+    if snapshot.pressure in {"high", "critical"} or "process-high" in snapshot.checks or "process-critical" in snapshot.checks:
+        psutil = _import_psutil()
+        if psutil is not None:
+            audit = _audit_processes(psutil)
+            snapshot = PerformanceSnapshot(**{**asdict(snapshot), "process_audit_summary": audit.summary})
+            _write_process_audit(audit, snapshot)
 
     load = "unavailable" if snapshot.load_1m is None else f"{snapshot.load_1m:.2f}"
     load_core = "unavailable" if snapshot.load_per_core is None else f"{snapshot.load_per_core:.2f}"
@@ -350,27 +472,12 @@ def log_performance_snapshot(prefix: str = "", apply_actions: bool = True) -> Op
     logger.info(
         "[PERF] %spressure=%s score=%d checks=%s cpu=%.1f%% load1=%s load_per_core=%s cores=%d "
         "mem=%.1f%% avail=%dMB swap=%.1f%% disk=%.1f%% processes=%d battery=%s plugged=%s "
-        "top_cpu=%s top_mem=%s action=%s recommendation=%s uptime=%ds",
-        tag,
-        snapshot.pressure,
-        snapshot.score,
-        ",".join(snapshot.checks),
-        snapshot.cpu_percent,
-        load,
-        load_core,
-        snapshot.cpu_count,
-        snapshot.memory_percent,
-        snapshot.memory_available_mb,
-        snapshot.swap_percent,
-        snapshot.disk_percent,
-        snapshot.process_count,
-        battery,
-        plugged,
-        snapshot.top_cpu,
-        snapshot.top_memory,
-        snapshot.action,
-        snapshot.recommendation,
-        snapshot.uptime_seconds,
+        "top_cpu=%s top_mem=%s audit=%s action=%s recommendation=%s uptime=%ds",
+        tag, snapshot.pressure, snapshot.score, ",".join(snapshot.checks), snapshot.cpu_percent,
+        load, load_core, snapshot.cpu_count, snapshot.memory_percent, snapshot.memory_available_mb,
+        snapshot.swap_percent, snapshot.disk_percent, snapshot.process_count, battery, plugged,
+        snapshot.top_cpu, snapshot.top_memory, snapshot.process_audit_summary, snapshot.action,
+        snapshot.recommendation, snapshot.uptime_seconds,
     )
     if prefix == "baseline":
         _write_baseline(snapshot)
@@ -386,16 +493,13 @@ def _monitor_loop(stop_event: threading.Event, interval: float) -> None:
 
 
 def start_performance_monitoring(interval_seconds: float = 60.0, auto_actions: bool = True) -> bool:
-    """Start lightweight system performance monitoring in a daemon thread."""
     global _monitor_thread, _stop_event, _start_time, _interval_seconds, _auto_actions_enabled
-
     with _lock:
         if _monitor_thread is not None and _monitor_thread.is_alive():
             return False
         if _import_psutil() is None:
             logger.warning("[PERF] Performance monitoring unavailable: psutil is not installed")
             return False
-
         _start_time = time.monotonic()
         _interval_seconds = max(15.0, float(interval_seconds))
         _auto_actions_enabled = bool(auto_actions)
@@ -410,16 +514,13 @@ def start_performance_monitoring(interval_seconds: float = 60.0, auto_actions: b
         _monitor_thread.start()
         logger.info(
             "[PERF] Periodic performance monitoring started (interval: %ds, auto_actions=%s)",
-            int(_interval_seconds),
-            str(_auto_actions_enabled).lower(),
+            int(_interval_seconds), str(_auto_actions_enabled).lower(),
         )
         return True
 
 
 def stop_performance_monitoring(timeout: float = 2.0) -> None:
-    """Stop the monitor thread and log one final snapshot."""
     global _monitor_thread, _stop_event
-
     with _lock:
         if _stop_event is None or _monitor_thread is None:
             return
@@ -431,7 +532,6 @@ def stop_performance_monitoring(timeout: float = 2.0) -> None:
         thread = _monitor_thread
         _monitor_thread = None
         _stop_event = None
-
     try:
         thread.join(timeout=timeout)
     except Exception:

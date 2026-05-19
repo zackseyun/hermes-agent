@@ -111,6 +111,7 @@ def test_auto_actions_can_be_disabled(monkeypatch):
         power_plugged=None,
         top_cpu="x:1:99.0%cpu",
         top_memory="x:1:1.0%mem",
+        process_audit_summary="not-collected",
         pressure="critical",
         score=50,
         checks=("memory-ok", "cpu-critical", "disk-ok"),
@@ -129,3 +130,19 @@ def test_unavailable_psutil_warns_and_does_not_start(caplog, monkeypatch):
     assert pm.start_performance_monitoring(interval_seconds=3600.0) is False
     assert pm.is_running() is False
     assert any("Performance monitoring unavailable" in r.getMessage() for r in caplog.records)
+
+
+def test_process_auditor_classifies_browser_and_sync_candidates():
+    assert pm._categorize_process({"name": "Google Chrome Helper (Renderer)", "cmdline": []}) == "browser-helper"
+    assert pm._categorize_process({"name": "Google Drive", "cmdline": []}) == "sync-service"
+    risk, recommendation, safe = pm._process_recommendation("browser-helper", cpu=45.0, mem=1.2, status="running")
+    assert risk == "medium"
+    assert "tabs" in recommendation
+    assert safe is False
+
+
+def test_process_auditor_marks_hermes_safe_auto_action():
+    risk, recommendation, safe = pm._process_recommendation("hermes", cpu=55.0, mem=1.2, status="running")
+    assert risk == "high"
+    assert "Hermes" in recommendation
+    assert safe is True
