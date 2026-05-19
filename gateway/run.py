@@ -17928,7 +17928,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 _pm_interval = float(_pm_cfg.get("interval_seconds", 60))
             except (TypeError, ValueError):
                 _pm_interval = 60.0
-            _performance_monitor.start_performance_monitoring(interval_seconds=_pm_interval)
+            _performance_monitor.start_performance_monitoring(
+                interval_seconds=_pm_interval,
+                auto_actions=bool(_pm_cfg.get("auto_actions", True)),
+            )
     except Exception as _pm_exc:
         logger.debug("Failed to start performance monitor: %s", _pm_exc)
 
