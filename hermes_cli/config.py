@@ -1591,6 +1591,15 @@ DEFAULT_CONFIG = {
             "enabled": True,         # Flip to false to silence the periodic line
             "interval_seconds": 300, # Default: every 5 minutes
         },
+        # Lightweight whole-machine performance telemetry (gateway only).
+        # Emits a grep-friendly "[PERF] ..." line with CPU, memory, swap,
+        # disk pressure, hottest processes, and a conservative recommendation.
+        # Keep this cheap and frequent; let the model reason only when pressure
+        # is high so Hermes does not become the performance problem.
+        "performance_monitor": {
+            "enabled": True,        # Flip to false to silence performance telemetry
+            "interval_seconds": 60, # Frequent, low-overhead sampling
+        },
     },
 
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
