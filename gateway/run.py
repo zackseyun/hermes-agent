@@ -17909,6 +17909,29 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as _mm_exc:
         logger.debug("Failed to start memory monitor: %s", _mm_exc)
 
+    # Lightweight whole-machine performance telemetry.  This is separate from
+    # process RSS leak tracking: it lets Hermes see when the Mac is under CPU,
+    # memory, swap, or disk pressure without invoking the local model constantly.
+    # Controlled by logging.performance_monitor in config.yaml.
+    try:
+        from gateway import performance_monitor as _performance_monitor
+
+        _pm_cfg = {}
+        try:
+            from hermes_cli.config import load_config as _load_cli_config
+
+            _pm_cfg = (_load_cli_config() or {}).get("logging", {}).get("performance_monitor", {}) or {}
+        except Exception:
+            _pm_cfg = {}
+        if _pm_cfg.get("enabled", True):
+            try:
+                _pm_interval = float(_pm_cfg.get("interval_seconds", 60))
+            except (TypeError, ValueError):
+                _pm_interval = 60.0
+            _performance_monitor.start_performance_monitoring(interval_seconds=_pm_interval)
+    except Exception as _pm_exc:
+        logger.debug("Failed to start performance monitor: %s", _pm_exc)
+
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
     # verbosity=0    (default):    WARNING and above
@@ -18132,6 +18155,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from gateway import memory_monitor as _memory_monitor
 
         _memory_monitor.stop_memory_monitoring(timeout=2.0)
+    except Exception:
+        pass
+    try:
+        from gateway import performance_monitor as _performance_monitor
+
+        _performance_monitor.stop_performance_monitoring(timeout=2.0)
     except Exception:
         pass
 
