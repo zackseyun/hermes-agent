@@ -1599,6 +1599,10 @@ DEFAULT_CONFIG = {
         "performance_monitor": {
             "enabled": True,        # Flip to false to silence performance telemetry
             "interval_seconds": 60, # Frequent, low-overhead sampling
+            # Safe self-protection only: Python GC during pressure and lower
+            # Hermes process priority during critical CPU pressure. Does not
+            # kill apps, delete files, or run expensive model loops.
+            "auto_actions": True,
         },
     },
 
